@@ -2,6 +2,18 @@
 import { request } from 'undici';
 import Busboy from 'busboy';
 
+// thêm dưới: import { request } from 'undici'; import Busboy from 'busboy';
+async function readJsonSafe(resp) {
+  // Đọc body 1 lần duy nhất
+  const text = await resp.body.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text }; // nếu không phải JSON, trả về raw để debug
+  }
+}
+
+
 export const config = { api: { bodyParser: false } };
 
 export default async function handler(req, res) {
@@ -67,12 +79,13 @@ export default async function handler(req, res) {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json; charset=UTF-8'
+        'Content-Type': 'application/json; charset=UTF-8',
+        'Accept': 'application/json'
       },
       body: JSON.stringify(initBody),
       signal: AbortSignal.timeout(20000)
     });
-    const initData = await initResp.body.json();
+    const initData = await readJsonSafe(initResp);
 
     // 🔧 Sửa ở đây: kiểm tra bằng statusCode thay vì .ok
     if (initResp.statusCode < 200 || initResp.statusCode >= 300) {
@@ -124,7 +137,8 @@ export default async function handler(req, res) {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
       },
       body: JSON.stringify({
         publish_id: publishId,
@@ -132,7 +146,7 @@ export default async function handler(req, res) {
       }),
       signal: AbortSignal.timeout(20000)
     });
-    const finalizeData = await finalizeResp.body.json();
+    const finalizeData = await readJsonSafe(finalizeResp);
 
     if (finalizeResp.statusCode < 200 || finalizeResp.statusCode >= 300) {
       return res.status(finalizeResp.statusCode).json({
