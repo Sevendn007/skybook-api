@@ -9,118 +9,135 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const accessToken = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
   if (!accessToken) return res.status(401).json({ error: 'Missing access token' });
 
-  // Lấy mode
+  // Lấy mode từ query: draft | publish (mặc định draft)
   const url = new URL(req.url, 'http://localhost');
-  const mode = (url.searchParams.get('mode') || 'draft').toLowerCase(); // draft | publish
+  const mode = (url.searchParams.get('mode') || 'draft').toLowerCase();
+  const isDraft = mode === 'draft';
 
-  // Chuẩn bị đọc multipart
-  const busboy = Busboy({ headers: req.headers });
+  // Biến chung cho kết quả các bước
   let caption = '';
+  let initData = null;
   let uploadResult = null;
-  let gotFile = false;
-  let fileStream = null;
+  let publishId = null;
 
-  const parts = new Promise((resolve, reject) => {
-    busboy.on('field', (name, value) => {
-      if (name === 'caption') caption = value;
-    });
-
-    busboy.on('file', (_name, file) => {
-      gotFile = true;
-      fileStream = file; // giữ stream video
-    });
-
-    busboy.on('finish', () => {
-      if (!gotFile) reject(new Error('No video file uploaded (field name must be "video")'));
-      else resolve();
-    });
-
-    busboy.on('error', reject);
-  });
-
-  req.pipe(busboy);
-  await parts;
-
-  // 1) Gọi INIT (lấy upload_url & publish_id)
   try {
-    const initEndpoint = mode === 'draft'
-      ? 'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/'
-      : 'https://open.tiktokapis.com/v2/post/publish/video/init/';
+    // Sẽ INIT khi nhận được stream file lần đầu, rồi stream thẳng lên TikTok (FILE_UPLOAD)
+    const busboy = Busboy({ headers: req.headers });
 
-    const initBody = mode === 'draft'
-      ? { source_info: { source: 'FILE_UPLOAD' } }
-      : {
-          post_info: { privacy_level: 'SELF_ONLY', title: caption || '' },
-          source_info: { source: 'FILE_UPLOAD' }
-        };
+    // Promise sẽ resolve khi toàn bộ multipart kết thúc
+    const finished = new Promise((resolve, reject) => {
+      let didStartUpload = false;
 
-    const initResp = await request(initEndpoint, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json; charset=UTF-8'
-      },
-      body: JSON.stringify(initBody),
-      signal: AbortSignal.timeout(20000)
-    });
-
-    const initData = await initResp.body.json();
-
-    if (!initResp.ok) {
-      return res.status(initResp.statusCode).json({ step: 'init_failed', response: initData });
-    }
-
-    const publishId = initData?.data?.publish_id;
-    const uploadUrl =
-      initData?.data?.upload_url ||
-      initData?.data?.upload?.upload_url ||
-      null;
-
-    if (!uploadUrl) {
-      return res.status(500).json({ error: 'No upload_url returned', initData });
-    }
-
-    // 2) UPLOAD video vào upload_url
-    const uploadResp = await request(uploadUrl, {
-      method: 'PUT',
-      body: fileStream,
-      headers: { 'Content-Type': 'video/mp4' },
-      signal: AbortSignal.timeout(120000)
-    });
-
-    const uploadText = await uploadResp.body.text();
-    uploadResult = { status: uploadResp.statusCode, body: uploadText };
-
-    if (!uploadResp.ok) {
-      return res.status(uploadResp.statusCode).json({
-        step: 'upload_failed',
-        init: initData,
-        upload: uploadResult
+      // Lấy caption từ form fields
+      busboy.on('field', (name, value) => {
+        if (name === 'caption') caption = value;
       });
+
+      // Khi nhận file: INIT → PUT upload_url với body=file (stream trực tiếp)
+      busboy.on('file', async (fieldname, file /*, info */) => {
+        if (fieldname !== 'video') {
+          // Bỏ qua field khác
+          file.resume();
+          return;
+        }
+        if (didStartUpload) {
+          // Chỉ nhận 1 file; bỏ qua file tiếp theo nếu có
+          file.resume();
+          return;
+        }
+        didStartUpload = true;
+
+        try {
+          const initEndpoint = isDraft
+            ? 'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/'
+            : 'https://open.tiktokapis.com/v2/post/publish/video/init/';
+
+          // Với publish, title có thể để trống ở init; sẽ set lại ở finalize
+          const initBody = isDraft
+            ? { source_info: { source: 'FILE_UPLOAD' } }
+            : { post_info: { privacy_level: 'SELF_ONLY', title: caption || '' },
+                source_info: { source: 'FILE_UPLOAD' } };
+
+          const initResp = await request(initEndpoint, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json; charset=UTF-8'
+            },
+            body: JSON.stringify(initBody),
+            signal: AbortSignal.timeout(20000) // 20s cho INIT
+          });
+          initData = await initResp.body.json();
+
+          if (!initResp.ok) {
+            // Ngừng đọc file, trả lỗi INIT
+            file.resume();
+            return reject({ step: 'init_failed', status: initResp.statusCode, response: initData });
+          }
+
+          publishId = initData?.data?.publish_id || null;
+          const uploadUrl =
+            initData?.data?.upload_url ||
+            initData?.data?.upload?.upload_url ||
+            null;
+
+          if (!uploadUrl) {
+            file.resume();
+            return reject({ step: 'init_no_upload_url', status: 500, response: initData });
+          }
+
+          // UPLOAD: stream trực tiếp file lên TikTok (PUT upload_url)
+          const upResp = await request(uploadUrl, {
+            method: 'PUT',
+            body: file, // <<--- STREAM trực tiếp, không lưu vào bộ nhớ
+            headers: { 'Content-Type': 'video/mp4' },
+            signal: AbortSignal.timeout(300000) // 300s cho upload
+          });
+          const upText = await upResp.body.text();
+          uploadResult = { status: upResp.statusCode, body: upText };
+
+          if (!upResp.ok) {
+            return reject({ step: 'upload_failed', status: upResp.statusCode, init: initData, upload: uploadResult });
+          }
+
+          // Không finalize ở đây; đợi đến khi multipart kết thúc (để chắc chắn đã nhận xong caption)
+        } catch (err) {
+          return reject({ step: 'upload_exception', error: String(err) });
+        }
+      });
+
+      busboy.on('finish', () => resolve());
+      busboy.on('error', (e) => reject({ step: 'busboy_error', error: String(e) }));
+    });
+
+    req.pipe(busboy);
+    await finished;
+
+    // Nếu chưa có uploadResult thì nghĩa là không có file 'video'
+    if (!uploadResult) {
+      return res.status(400).json({ error: 'No video file uploaded (field name must be "video")' });
     }
 
-    // 3) Nếu Draft → xong
-    if (mode === 'draft') {
+    // Draft: xong sau khi upload
+    if (isDraft) {
       return res.status(200).json({
         success: true,
         mode: 'draft',
-        message: '✅ Video đã upload vào Draft (Inbox). Mở TikTok → mục Nháp để xem.',
+        message: '✅ Video đã upload vào Draft/Inbox. Mở TikTok (tài khoản sandbox) để xem.',
         init: initData,
         upload: uploadResult
       });
     }
 
-    // 4) Nếu Publish → cần Finalize
-    const finalizeResp = await request(
-      'https://open.tiktokapis.com/v2/post/publish/video/',
-      {
+    // Publish: cần FINALIZE (đăng thật, SELF_ONLY cho sandbox)
+    try {
+      const finalizeResp = await request('https://open.tiktokapis.com/v2/post/publish/video/', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${accessToken}`,
@@ -130,31 +147,41 @@ export default async function handler(req, res) {
           publish_id: publishId,
           post_info: { title: caption || '', privacy_level: 'SELF_ONLY' }
         }),
-        signal: AbortSignal.timeout(20000)
+        signal: AbortSignal.timeout(20000) // 20s cho FINALIZE
+      });
+      const finalizeData = await finalizeResp.body.json();
+
+      if (!finalizeResp.ok) {
+        return res.status(finalizeResp.statusCode).json({
+          step: 'finalize_failed',
+          init: initData,
+          upload: uploadResult,
+          finalize: finalizeData
+        });
       }
-    );
 
-    const finalizeData = await finalizeResp.body.json();
-
-    if (!finalizeResp.ok) {
-      return res.status(finalizeResp.statusCode).json({
-        step: 'finalize_failed',
+      return res.status(200).json({
+        success: true,
+        mode: 'publish',
+        message: '✅ Video đã đăng lên TikTok (SELF_ONLY). Kiểm tra trong hồ sơ của tài khoản sandbox.',
         init: initData,
         upload: uploadResult,
         finalize: finalizeData
       });
+    } catch (e) {
+      return res.status(500).json({
+        step: 'finalize_exception',
+        error: String(e),
+        init: initData,
+        upload: uploadResult
+      });
     }
-
-    return res.status(200).json({
-      success: true,
-      mode: 'publish',
-      message: '✅ Video đã đăng lên TikTok (chế độ SELF_ONLY).',
-      init: initData,
-      upload: uploadResult,
-      finalize: finalizeData
-    });
-
   } catch (e) {
-    return res.status(500).json({ error: String(e) });
+    // Lỗi tổng quát
+    const msg = typeof e === 'object' && e && 'step' in e
+      ? e
+      : { step: 'server_exception', error: String(e) };
+    const status = e?.status || 500;
+    return res.status(status).json(msg);
   }
 }
