@@ -132,39 +132,47 @@ export default async function handler(req, res) {
       });
     }
 
-    // 5) Publish: finalize để đăng (SELF_ONLY trong sandbox)
-    const finalizeResp = await request('https://open.tiktokapis.com/v2/post/publish/video/', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
-      body: JSON.stringify({
-        publish_id: publishId,
-        post_info: { title: caption || '', privacy_level: 'SELF_ONLY' }
-      }),
-      signal: AbortSignal.timeout(20000)
-    });
-    const finalizeData = await readJsonSafe(finalizeResp);
+    // // 5) Publish: finalize để đăng (SELF_ONLY trong sandbox)
+    // const finalizeResp = await request('https://open.tiktokapis.com/v2/post/publish/video/', {
+    //   method: 'POST',
+    //   headers: {
+    //     'Authorization': `Bearer ${accessToken}`,
+    //     'Content-Type': 'application/json',
+    //     'Accept': 'application/json'
+    //   },
+    //   body: JSON.stringify({
+    //     publish_id: publishId,
+    //     post_info: { title: caption || '', privacy_level: 'SELF_ONLY' }
+    //   }),
+    //   signal: AbortSignal.timeout(20000)
+    // });
+    // const finalizeData = await readJsonSafe(finalizeResp);
 
-    if (finalizeResp.statusCode < 200 || finalizeResp.statusCode >= 300) {
-      return res.status(finalizeResp.statusCode).json({
-        step: 'finalize_failed',
-        init: initData,
-        upload: uploadResult,
-        finalize: finalizeData
-      });
-    }
+    // if (finalizeResp.statusCode < 200 || finalizeResp.statusCode >= 300) {
+    //   return res.status(finalizeResp.statusCode).json({
+    //     step: 'finalize_failed',
+    //     init: initData,
+    //     upload: uploadResult,
+    //     finalize: finalizeData
+    //   });
+    // }
 
+    // return res.status(200).json({
+    //   success: true,
+    //   mode: 'publish',
+    //   message: '✅ Video đã đăng lên TikTok (SELF_ONLY). Vào hồ sơ để xem.',
+    //   init: initData,
+    //   upload: uploadResult,
+    //   finalize: finalizeData
+    // });
     return res.status(200).json({
       success: true,
       mode: 'publish',
-      message: '✅ Video đã đăng lên TikTok (SELF_ONLY). Vào hồ sơ để xem.',
+      message: '✅ Đã upload video cho Direct Post. Hệ thống sẽ xử lý; hãy poll /v2/post/publish/status/fetch/ để theo dõi đến khi PUBLISH_COMPLETE.',
       init: initData,
-      upload: uploadResult,
-      finalize: finalizeData
+      upload: uploadResult
     });
+
 
   } catch (e) {
     return res.status(500).json({ step: 'server_exception', error: String(e) });
