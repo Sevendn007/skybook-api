@@ -20,7 +20,7 @@ export default async function handler(req, res) {
   const isDraft = mode === 'draft';
 
   try {
-    // 1) Nhận multipart: lấy caption + đọc file 'video' vào Buffer (để biết size)
+    // 1) Nhận multipart: caption + file 'video' -> buffer (để biết size & set Content-Length/Range)
     const busboy = Busboy({ headers: req.headers });
     let caption = '';
     let fileBufs = [];
@@ -33,8 +33,8 @@ export default async function handler(req, res) {
         if (name !== 'video') { file.resume(); return; }
         gotFile = true;
         file.on('data', (chunk) => { fileBufs.push(chunk); fileSize += chunk.length; });
-        file.on('limit', () => reject(new Error('File too large')));
-        file.on('end', () => resolve());
+        file.on('end', resolve);
+        file.on('error', reject);
       });
       busboy.on('finish', () => { if (!gotFile) reject(new Error('No video file uploaded (field "video")')); });
       busboy.on('error', reject);
@@ -43,11 +43,11 @@ export default async function handler(req, res) {
     req.pipe(busboy);
     await done;
 
+    if (!fileSize) return res.status(400).json({ error: 'Empty video file' });
     const videoBuffer = Buffer.concat(fileBufs);
     const videoSize = fileSize;
-    if (!videoSize) return res.status(400).json({ error: 'Empty video file' });
 
-    // 2) INIT (FILE_UPLOAD) theo yêu cầu của TikTok: cần video_size, chunk_size, total_chunk_count
+    // 2) INIT (FILE_UPLOAD) — BẮT BUỘC có video_size/chunk_size/total_chunk_count
     const initEndpoint = isDraft
       ? 'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/'
       : 'https://open.tiktokapis.com/v2/post/publish/video/init/';
@@ -55,7 +55,7 @@ export default async function handler(req, res) {
     const source_info = {
       source: 'FILE_UPLOAD',
       video_size: videoSize,
-      chunk_size: videoSize,       // 1 chunk
+      chunk_size: videoSize,    // 1 chunk
       total_chunk_count: 1
     };
 
@@ -73,7 +73,9 @@ export default async function handler(req, res) {
       signal: AbortSignal.timeout(20000)
     });
     const initData = await initResp.body.json();
-    if (!initResp.ok) {
+
+    // 🔧 Sửa ở đây: kiểm tra bằng statusCode thay vì .ok
+    if (initResp.statusCode < 200 || initResp.statusCode >= 300) {
       return res.status(initResp.statusCode).json({ step: 'init_failed', response: initData });
     }
 
@@ -87,7 +89,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ step: 'init_no_upload_url', init: initData });
     }
 
-    // 3) UPLOAD 1 chunk với Content-Length + Content-Range (theo doc)
+    // 3) UPLOAD — 1 chunk với Content-Length & Content-Range
     const lastByte = videoSize - 1;
     const uploadResp = await request(uploadUrl, {
       method: 'PUT',
@@ -97,15 +99,16 @@ export default async function handler(req, res) {
         'Content-Range': `bytes 0-${lastByte}/${videoSize}`
       },
       body: videoBuffer,
-      signal: AbortSignal.timeout(300000)
+      signal: AbortSignal.timeout(300000) // 300s
     });
     const uploadText = await uploadResp.body.text();
     const uploadResult = { status: uploadResp.statusCode, body: uploadText };
-    if (!uploadResp.ok) {
+
+    if (uploadResp.statusCode < 200 || uploadResp.statusCode >= 300) {
       return res.status(uploadResp.statusCode).json({ step: 'upload_failed', init: initData, upload: uploadResult });
     }
 
-    // 4) Draft: hoàn tất
+    // 4) Draft: xong sau upload
     if (isDraft) {
       return res.status(200).json({
         success: true,
@@ -116,7 +119,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 5) Publish: finalize để tạo bài (SELF_ONLY trong sandbox)
+    // 5) Publish: finalize để đăng (SELF_ONLY trong sandbox)
     const finalizeResp = await request('https://open.tiktokapis.com/v2/post/publish/video/', {
       method: 'POST',
       headers: {
@@ -130,7 +133,8 @@ export default async function handler(req, res) {
       signal: AbortSignal.timeout(20000)
     });
     const finalizeData = await finalizeResp.body.json();
-    if (!finalizeResp.ok) {
+
+    if (finalizeResp.statusCode < 200 || finalizeResp.statusCode >= 300) {
       return res.status(finalizeResp.statusCode).json({
         step: 'finalize_failed',
         init: initData,
@@ -142,7 +146,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       success: true,
       mode: 'publish',
-      message: '✅ Video đã đăng lên TikTok (SELF_ONLY). Vào hồ sơ (Only me) để xem.',
+      message: '✅ Video đã đăng lên TikTok (SELF_ONLY). Vào hồ sơ để xem.',
       init: initData,
       upload: uploadResult,
       finalize: finalizeData
